@@ -346,6 +346,9 @@ def create_loss(args):
             world_size=args.world_size,
         )
     return ClipLoss(
+        use_sinkhorn=args.use_sinkhorn,
+        use_sinkhorn_partial=args.use_sinkhorn_partial,
+        feature_swap_ratio=args.feature_swap_ratio,
         local_loss=args.local_loss,
         gather_with_grad=args.gather_with_grad,
         cache_labels=True,

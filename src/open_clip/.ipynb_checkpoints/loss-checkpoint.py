@@ -10,11 +10,6 @@ try:
 except ImportError:
     has_distributed = False
 
-try:
-    import horovod.torch as hvd
-except ImportError:
-    hvd = None
-
 
 # def gather_features(
 #         image_features,
@@ -114,7 +109,7 @@ except ImportError:
 #         else:
 #             logits_per_image = logit_scale * image_features @ text_features.T
 #             logits_per_text = logit_scale * text_features @ image_features.T
-        
+
 #         return logits_per_image, logits_per_text
 
 #     def forward(self, image_features, text_features, logit_scale, output_dict=False):
@@ -131,75 +126,86 @@ except ImportError:
 #         return {"contrastive_loss": total_loss} if output_dict else total_loss
 
 
+import torch.distributed as dist
+
+
+def gather_tensor(tensor, with_grad=False, world_size=1, rank=0, local_loss=False):
+    if with_grad:
+        return torch.cat(torch.distributed.nn.all_gather(tensor), dim=0)
+
+    gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered_tensors, tensor)
+
+    if not local_loss:
+        gathered_tensors[rank] = tensor
+
+    return torch.cat(gathered_tensors, dim=0)
+
+
 def gather_features(
-        image_features,
-        image_aug_features,
-        text_features,
-        text_aug_features,
-        local_loss=False,
-        gather_with_grad=False,
-        rank=0,
-        world_size=1,
-        use_horovod=False
+    image_features,
+    image_aug_features,
+    text_features,
+    text_aug_features,
+    unpaired_image_features=None,
+    unpaired_image_aug_features=None,
+    local_loss=False,
+    gather_with_grad=False,
+    rank=0,
+    world_size=1,
 ):
-    assert has_distributed, 'torch.distributed did not import correctly, please use a PyTorch version with support.'
-    if use_horovod:
-        assert hvd is not None, 'Please install horovod'
-        if gather_with_grad:
-            all_image_features = hvd.allgather(image_features)
-            all_text_features = hvd.allgather(text_features)
-        else:
-            with torch.no_grad():
-                all_image_features = hvd.allgather(image_features)
-                all_text_features = hvd.allgather(text_features)
-            if not local_loss:
-                # ensure grads for local rank when all_* features don't have a gradient
-                gathered_image_features = list(all_image_features.chunk(world_size, dim=0))
-                gathered_text_features = list(all_text_features.chunk(world_size, dim=0))
-                gathered_image_features[rank] = image_features
-                gathered_text_features[rank] = text_features
-                all_image_features = torch.cat(gathered_image_features, dim=0)
-                all_text_features = torch.cat(gathered_text_features, dim=0)
-    else:
-        # We gather tensors from all gpus
-        if gather_with_grad:
-            all_image_features = torch.cat(torch.distributed.nn.all_gather(image_features), dim=0)
-            all_text_features = torch.cat(torch.distributed.nn.all_gather(text_features), dim=0)
-            all_image_aug_features = torch.cat(torch.distributed.nn.all_gather(image_aug_features), dim=0)
-            all_text_aug_features = torch.cat(torch.distributed.nn.all_gather(text_aug_features), dim=0)
-        else:
-            gathered_image_features = [torch.zeros_like(image_features) for _ in range(world_size)]
-            gathered_text_features = [torch.zeros_like(text_features) for _ in range(world_size)]
-            gathered_image_aug_features = [torch.zeros_like(image_aug_features) for _ in range(world_size)]
-            gathered_text_aug_features = [torch.zeros_like(text_aug_features) for _ in range(world_size)]
-            dist.all_gather(gathered_image_features, image_features)
-            dist.all_gather(gathered_text_features, text_features)
-            dist.all_gather(gathered_image_aug_features, image_aug_features)
-            dist.all_gather(gathered_text_aug_features, text_aug_features)
-            if not local_loss:
-                # ensure grads for local rank when all_* features don't have a gradient
-                gathered_image_features[rank] = image_features
-                gathered_text_features[rank] = text_features
-                gathered_image_aug_features[rank] = image_aug_features
-                gathered_text_aug_features[rank] = text_aug_features
-            all_image_features = torch.cat(gathered_image_features, dim=0)
-            all_text_features = torch.cat(gathered_text_features, dim=0)
-            all_image_aug_features = torch.cat(gathered_image_aug_features, dim=0)
-            all_text_aug_features = torch.cat(gathered_text_aug_features, dim=0)
+    assert (
+        has_distributed
+    ), "torch.distributed did not import correctly, please use a PyTorch version with support."
 
-    return all_image_features, all_image_aug_features, all_text_features, all_text_aug_features
+    all_image_features = gather_tensor(
+        image_features, gather_with_grad, world_size, rank, local_loss
+    )
+    all_text_features = gather_tensor(
+        text_features, gather_with_grad, world_size, rank, local_loss
+    )
+    all_image_aug_features = gather_tensor(
+        image_aug_features, gather_with_grad, world_size, rank, local_loss
+    )
+    all_text_aug_features = gather_tensor(
+        text_aug_features, gather_with_grad, world_size, rank, local_loss
+    )
+    all_unpaired_image_features = (
+        None
+        if unpaired_image_features is None
+        else gather_tensor(
+            unpaired_image_features, gather_with_grad, world_size, rank, local_loss
+        )
+    )
+    all_unpaired_image_aug_features = (
+        None
+        if unpaired_image_aug_features is None
+        else gather_tensor(
+            unpaired_image_aug_features, gather_with_grad, world_size, rank, local_loss
+        )
+    )
 
+    return (
+        all_image_features,
+        all_image_aug_features,
+        all_text_features,
+        all_text_aug_features,
+        all_unpaired_image_features,
+        all_unpaired_image_aug_features,
+    )
 
 
 class ClipLoss(nn.Module):
     def __init__(
-            self,
-            local_loss=False,
-            gather_with_grad=False,
-            cache_labels=False,
-            rank=0,
-            world_size=1,
-            use_horovod=False,
+        self,
+        use_sinkhorn,
+        use_sinkhorn_partial,
+        feature_swap_ratio,
+        local_loss=False,
+        gather_with_grad=False,
+        cache_labels=False,
+        rank=0,
+        world_size=1,
     ):
         super().__init__()
         self.local_loss = local_loss
@@ -207,7 +213,9 @@ class ClipLoss(nn.Module):
         self.cache_labels = cache_labels
         self.rank = rank
         self.world_size = world_size
-        self.use_horovod = use_horovod
+        self.use_sinkhorn = use_sinkhorn
+        self.feature_swap_ratio = feature_swap_ratio
+        self.use_sinkhorn_partial = use_sinkhorn_partial
 
         # cache state
         self.prev_num_logits = 0
@@ -226,40 +234,76 @@ class ClipLoss(nn.Module):
             labels = self.labels[device]
         return labels
 
-    def get_logits(self, image_features, image_aug_features, text_features, text_aug_features, logit_scale):
+    def get_logits(
+        self,
+        all_image_features,
+        all_image_aug_features,
+        all_text_features,
+        all_text_aug_features,
+        logit_scale,
+    ):
+        logits_text_text_aug = logit_scale * (
+            all_text_features @ all_text_aug_features.T
+        )
+        logits_image_image_aug = logit_scale * (
+            all_image_features @ all_image_aug_features.T
+        )
+        logits_text_image = logit_scale * (all_text_features @ all_image_features.T)
+        logits_text_aug_image_aug = logit_scale * (
+            all_text_aug_features @ all_image_aug_features.T
+        )
+
+        return (
+            logits_text_text_aug,
+            logits_image_image_aug,
+            logits_text_image,
+            logits_text_aug_image_aug,
+        )
+
+    def get_unpaired_sim(
+        self,
+        unpaired_image_features,
+        unpaired_image_aug_features,
+        text_features,
+        text_aug_features,
+        logit_scale,
+    ):
         if self.world_size > 1:
-            all_image_features, all_image_aug_features, all_text_features, all_text_aug_features = gather_features(
-                image_features, image_aug_features, text_features, text_aug_features,
-                self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod)
-
-            logits_text_text_aug = logit_scale * (text_features @ all_text_aug_features.T if self.local_loss else all_text_features @ all_text_aug_features.T)
-            logits_image_image_aug = logit_scale * (image_features @ all_image_aug_features.T if self.local_loss else all_image_features @ all_image_aug_features.T)
-            logits_text_image = logit_scale * (text_features @ all_image_features.T if self.local_loss else all_text_features @ all_image_features.T)
-            logits_text_aug_image_aug = logit_scale * (text_aug_features @ all_image_aug_features.T if self.local_loss else all_text_aug_features @ all_image_aug_features.T)
-
+            (
+                all_image_features,
+                all_image_aug_features,
+                all_text_features,
+                all_text_aug_features,
+            ) = gather_features(
+                unpaired_image_features,
+                unpaired_image_aug_features,
+                text_features,
+                text_aug_features,
+                self.local_loss,
+                self.gather_with_grad,
+                self.rank,
+                self.world_size,
+            )
         else:
-            logits_text_text_aug = logit_scale * text_features @ text_aug_features.T
-            logits_image_image_aug = logit_scale * image_features @ image_aug_features.T
-            logits_text_image = logit_scale * text_features @ image_features.T
-            logits_text_aug_image_aug = logit_scale * text_aug_features @ image_aug_features.T
-
-        return logits_text_text_aug, logits_image_image_aug, logits_text_image, logits_text_aug_image_aug
-    
-    def get_unpaired_sim(self, unpaired_image_features, unpaired_image_aug_features, text_features, text_aug_features, logit_scale):
-        if self.world_size > 1:
-            all_image_features, all_image_aug_features, all_text_features, all_text_aug_features = gather_features(
-                unpaired_image_features, unpaired_image_aug_features, text_features, text_aug_features,
-                self.local_loss, self.gather_with_grad, self.rank, self.world_size)
-        else:
-            all_image_features, all_image_aug_features, all_text_features, all_text_aug_features = (
-                unpaired_image_features, unpaired_image_aug_features, text_features, text_aug_features
+            (
+                all_image_features,
+                all_image_aug_features,
+                all_text_features,
+                all_text_aug_features,
+            ) = (
+                unpaired_image_features,
+                unpaired_image_aug_features,
+                text_features,
+                text_aug_features,
             )
 
-        sim_image = torch.mm(all_image_features, all_image_aug_features.t()) * logit_scale
+        sim_image = (
+            torch.mm(all_image_features, all_image_aug_features.t()) * logit_scale
+        )
         sim_text = torch.mm(all_text_features, all_text_aug_features.t()) * logit_scale
 
         return sim_image, sim_text
-    
+
     def infonce_loss(self, similarity_matrix, tau=1.0):
         scaled_sim = similarity_matrix / tau
         positive_samples = torch.diag(scaled_sim)
@@ -271,51 +315,128 @@ class ClipLoss(nn.Module):
         loss = torch.mean(per_sample_loss)
 
         return loss
-    
-    def forward(self, image_features, image_aug_features, text_features, text_aug_features, unpaired_image_features, unpaired_image_aug_features, logit_scale, output_dict=False):
-        device = image_features.device
-        logits_text_text_aug, logits_image_image_aug, logits_text_image, logits_text_aug_image_aug = self.get_logits(
-            image_features, image_aug_features, text_features, text_aug_features, logit_scale)
 
-        sim = torch.cat([
-            torch.cat([logits_text_text_aug, logits_image_image_aug], dim=1),
-            torch.cat([logits_text_image, logits_text_aug_image_aug], dim=1)
-        ], dim=0)
+    def iterate_P(sefl, sim_matrix, num_iterations=5):
+        P = torch.exp(sim_matrix)
+
+        for _ in range(num_iterations):
+            rowP = P.sum(dim=0)
+            P /= rowP
+
+            colP = P.sum(dim=1)
+            P /= colP
+        return P
+
+    def forward(
+        self,
+        image_features,
+        image_aug_features,
+        text_features,
+        text_aug_features,
+        unpaired_image_features,
+        unpaired_image_aug_features,
+        logit_scale,
+        output_dict=False,
+    ):
+        device = image_features.device
+
+        (
+            all_image_features,
+            all_image_aug_features,
+            all_text_features,
+            all_text_aug_features,
+            all_unpaired_image_features,
+            all_unpaired_image_aug_features,
+        ) = gather_features(
+            image_features,
+            image_aug_features,
+            text_features,
+            text_aug_features,
+            unpaired_image_features,
+            unpaired_image_aug_features,
+            self.local_loss,
+            self.gather_with_grad,
+            self.rank,
+            self.world_size,
+        )
+
+        (
+            logits_text_text_aug,
+            logits_image_image_aug,
+            logits_text_image,
+            logits_text_aug_image_aug,
+        ) = self.get_logits(
+            all_image_features,
+            all_image_aug_features,
+            all_text_features,
+            all_text_aug_features,
+            logit_scale,
+        )
+
+        sim = torch.cat(
+            [
+                torch.cat([logits_text_text_aug, logits_image_image_aug], dim=1),
+                torch.cat([logits_text_image, logits_text_aug_image_aug], dim=1),
+            ],
+            dim=0,
+        )
 
         # Get the ground truth indices
-        labels = torch.arange(sim.shape[0], device=sim.device)
+        labels = torch.arange(sim.shape[0], device=device)
 
-#         rows = -torch.mean(torch.log(F.softmax(sim, dim=1)[labels, labels]))
-#         cols = -torch.mean(torch.log(F.softmax(sim, dim=0)[labels, labels]))
-        rows = -torch.mean(F.log_softmax(sim, dim=1)[labels, labels])
-        cols = -torch.mean(F.log_softmax(sim, dim=0)[labels, labels])
-        
+        if self.use_sinkhorn:
+            P = self.iterate_P(sim)
+            paired_loss = -torch.mean(torch.log(P)[labels, labels])
+        else:
+            rows = -torch.mean(F.log_softmax(sim, dim=1)[labels, labels])
+            cols = -torch.mean(F.log_softmax(sim, dim=0)[labels, labels])
+
+            paired_loss = rows + cols
+
         has_unpaired = unpaired_image_features is not None
         up_sim_image = None
         up_sim_text = None
         if has_unpaired:
-            up_sim_image, up_sim_text = self.get_unpaired_sim(unpaired_image_features, unpaired_image_aug_features, text_features, text_aug_features, logit_scale)
+            up_sim_image, up_sim_text = self.get_unpaired_sim(
+                unpaired_image_features,
+                unpaired_image_aug_features,
+                text_features,
+                text_aug_features,
+                logit_scale,
+            )
 
-        up_image_loss = self.infonce_loss(up_sim_image) if has_unpaired else torch.tensor(0)
-        up_text_loss = self.infonce_loss(up_sim_text, tau=3.0) if has_unpaired else torch.tensor(0)
-        
+        up_image_loss = (
+            self.infonce_loss(up_sim_image) if has_unpaired else torch.tensor(0)
+        )
+        up_text_loss = (
+            self.infonce_loss(up_sim_text, tau=3.0) if has_unpaired else torch.tensor(0)
+        )
 
-        total_loss = rows + cols + up_image_loss + up_text_loss
+        total_loss = paired_loss + up_image_loss + up_text_loss
 
-        return {"rows": rows, "cols": cols, "up_img": up_image_loss, "up_text": up_text_loss} if output_dict else total_loss
-    
+        return (
+            {
+                "paired": paired_loss,
+                "up_img": up_image_loss,
+                "up_text": up_text_loss,
+            }
+            if output_dict
+            else total_loss
+        )
+
+
 class CoCaLoss(ClipLoss):
     def __init__(
-            self,
-            caption_loss_weight,
-            clip_loss_weight,
-            pad_id=0,  # pad_token for open_clip custom tokenizer
-            local_loss=False,
-            gather_with_grad=False,
-            cache_labels=False,
-            rank=0,
-            world_size=1,
-            use_horovod=False,
+        self,
+        caption_loss_weight,
+        clip_loss_weight,
+        pad_id=0,  # pad_token for open_clip custom tokenizer
+        local_loss=False,
+        gather_with_grad=False,
+        cache_labels=False,
+        rank=0,
+        world_size=1,
+        use_horovod=False,
     ):
         super().__init__(
             local_loss=local_loss,
@@ -323,17 +444,24 @@ class CoCaLoss(ClipLoss):
             cache_labels=cache_labels,
             rank=rank,
             world_size=world_size,
-            use_horovod=use_horovod
+            use_horovod=use_horovod,
         )
 
         self.clip_loss_weight = clip_loss_weight
         self.caption_loss_weight = caption_loss_weight
         self.caption_loss = nn.CrossEntropyLoss(ignore_index=pad_id)
 
-    def forward(self, image_features, text_features, logits, labels, logit_scale, output_dict=False):
-        
+    def forward(
+        self,
+        image_features,
+        text_features,
+        logits,
+        labels,
+        logit_scale,
+        output_dict=False,
+    ):
         clip_loss = torch.tensor(0)
-        
+
         if self.clip_loss_weight:
             clip_loss = super().forward(image_features, text_features, logit_scale)
             clip_loss = self.clip_loss_weight * clip_loss
@@ -351,36 +479,41 @@ class CoCaLoss(ClipLoss):
 
 
 class DistillClipLoss(ClipLoss):
-
     def dist_loss(self, teacher_logits, student_logits):
-        return -(teacher_logits.softmax(dim=1) * student_logits.log_softmax(dim=1)).sum(dim=1).mean(dim=0)
+        return (
+            -(teacher_logits.softmax(dim=1) * student_logits.log_softmax(dim=1))
+            .sum(dim=1)
+            .mean(dim=0)
+        )
 
     def forward(
-            self,
-            image_features,
-            text_features,
-            logit_scale,
-            dist_image_features,
-            dist_text_features,
-            dist_logit_scale,
-            output_dict=False,
+        self,
+        image_features,
+        text_features,
+        logit_scale,
+        dist_image_features,
+        dist_text_features,
+        dist_logit_scale,
+        output_dict=False,
     ):
-        logits_per_image, logits_per_text = \
-            self.get_logits(image_features, text_features, logit_scale)
+        logits_per_image, logits_per_text = self.get_logits(
+            image_features, text_features, logit_scale
+        )
 
-        dist_logits_per_image, dist_logits_per_text = \
-            self.get_logits(dist_image_features, dist_text_features, dist_logit_scale)
+        dist_logits_per_image, dist_logits_per_text = self.get_logits(
+            dist_image_features, dist_text_features, dist_logit_scale
+        )
 
         labels = self.get_ground_truth(image_features.device, logits_per_image.shape[0])
 
         contrastive_loss = (
-            F.cross_entropy(logits_per_image, labels) +
-            F.cross_entropy(logits_per_text, labels)
+            F.cross_entropy(logits_per_image, labels)
+            + F.cross_entropy(logits_per_text, labels)
         ) / 2
 
         distill_loss = (
-            self.dist_loss(dist_logits_per_image, logits_per_image) +
-            self.dist_loss(dist_logits_per_text, logits_per_text)
+            self.dist_loss(dist_logits_per_image, logits_per_image)
+            + self.dist_loss(dist_logits_per_text, logits_per_text)
         ) / 2
 
         if output_dict:
@@ -409,7 +542,9 @@ def neighbour_exchange(from_rank, to_rank, tensor, group=None):
     return tensor_recv
 
 
-def neighbour_exchange_bidir(left_rank, right_rank, tensor_to_left, tensor_to_right, group=None):
+def neighbour_exchange_bidir(
+    left_rank, right_rank, tensor_to_left, tensor_to_right, group=None
+):
     tensor_from_left = torch.zeros_like(tensor_to_right)
     tensor_from_right = torch.zeros_like(tensor_to_left)
     send_op_left = torch.distributed.P2POp(
@@ -436,7 +571,9 @@ def neighbour_exchange_bidir(left_rank, right_rank, tensor_to_left, tensor_to_ri
         right_rank,
         group=group,
     )
-    reqs = torch.distributed.batch_isend_irecv([send_op_right, send_op_left, recv_op_right, recv_op_left])
+    reqs = torch.distributed.batch_isend_irecv(
+        [send_op_right, send_op_left, recv_op_right, recv_op_left]
+    )
     for req in reqs:
         req.wait()
     return tensor_from_right, tensor_from_left
@@ -452,7 +589,9 @@ class NeighbourExchange(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return (None, None, None) + (NeighbourExchange.apply(ctx.to_rank, ctx.from_rank, ctx.group, grad_output),)
+        return (None, None, None) + (
+            NeighbourExchange.apply(ctx.to_rank, ctx.from_rank, ctx.group, grad_output),
+        )
 
 
 def neighbour_exchange_with_grad(from_rank, to_rank, tensor, group=None):
@@ -465,20 +604,27 @@ class NeighbourExchangeBidir(torch.autograd.Function):
         ctx.group = group
         ctx.left_rank = left_rank
         ctx.right_rank = right_rank
-        return neighbour_exchange_bidir(left_rank, right_rank, tensor_to_left, tensor_to_right, group=group)
+        return neighbour_exchange_bidir(
+            left_rank, right_rank, tensor_to_left, tensor_to_right, group=group
+        )
 
     @staticmethod
     def backward(ctx, *grad_outputs):
-        return (None, None, None) + \
-            NeighbourExchangeBidir.apply(ctx.right_rank, ctx.left_rank, ctx.group, *grad_outputs)
+        return (None, None, None) + NeighbourExchangeBidir.apply(
+            ctx.right_rank, ctx.left_rank, ctx.group, *grad_outputs
+        )
 
 
-def neighbour_exchange_bidir_with_grad(left_rank, right_rank, tensor_to_left, tensor_to_right, group=None):
-    return NeighbourExchangeBidir.apply(left_rank, right_rank, group, tensor_to_left, tensor_to_right)
+def neighbour_exchange_bidir_with_grad(
+    left_rank, right_rank, tensor_to_left, tensor_to_right, group=None
+):
+    return NeighbourExchangeBidir.apply(
+        left_rank, right_rank, group, tensor_to_left, tensor_to_right
+    )
 
 
 class SigLipLoss(nn.Module):
-    """ Sigmoid Loss for Language Image Pre-Training (SigLIP) - https://arxiv.org/abs/2303.15343
+    """Sigmoid Loss for Language Image Pre-Training (SigLIP) - https://arxiv.org/abs/2303.15343
 
     @article{zhai2023sigmoid,
       title={Sigmoid loss for language image pre-training},
@@ -487,13 +633,14 @@ class SigLipLoss(nn.Module):
       year={2023}
     }
     """
+
     def __init__(
-            self,
-            cache_labels=False,
-            rank=0,
-            world_size=1,
-            bidir=True,
-            use_horovod=False,
+        self,
+        cache_labels=False,
+        rank=0,
+        world_size=1,
+        bidir=True,
+        use_horovod=False,
     ):
         super().__init__()
         self.cache_labels = cache_labels
@@ -507,7 +654,9 @@ class SigLipLoss(nn.Module):
         self.prev_num_logits = 0
         self.labels = {}
 
-    def get_ground_truth(self, device, dtype, num_logits, negative_only=False) -> torch.Tensor:
+    def get_ground_truth(
+        self, device, dtype, num_logits, negative_only=False
+    ) -> torch.Tensor:
         labels = -torch.ones((num_logits, num_logits), device=device, dtype=dtype)
         if not negative_only:
             labels = 2 * torch.eye(num_logits, device=device, dtype=dtype) + labels
@@ -519,7 +668,14 @@ class SigLipLoss(nn.Module):
             logits += logit_bias
         return logits
 
-    def _loss(self, image_features, text_features, logit_scale, logit_bias=None, negative_only=False):
+    def _loss(
+        self,
+        image_features,
+        text_features,
+        logit_scale,
+        logit_bias=None,
+        negative_only=False,
+    ):
         logits = self.get_logits(image_features, text_features, logit_scale, logit_bias)
         labels = self.get_ground_truth(
             image_features.device,
@@ -530,7 +686,9 @@ class SigLipLoss(nn.Module):
         loss = -F.logsigmoid(labels * logits).sum() / image_features.shape[0]
         return loss
 
-    def forward(self, image_features, text_features, logit_scale, logit_bias, output_dict=False):
+    def forward(
+        self, image_features, text_features, logit_scale, logit_bias, output_dict=False
+    ):
         loss = self._loss(image_features, text_features, logit_scale, logit_bias)
 
         if self.world_size > 1:
@@ -560,7 +718,8 @@ class SigLipLoss(nn.Module):
 
                 if remainder:
                     text_features_recv = neighbour_exchange_with_grad(
-                        left_rank, right_rank, text_features_to_right)
+                        left_rank, right_rank, text_features_to_right
+                    )
 
                     loss += self._loss(
                         image_features,
@@ -573,7 +732,8 @@ class SigLipLoss(nn.Module):
                 text_features_to_right = text_features
                 for i in range(self.world_size - 1):
                     text_features_from_left = neighbour_exchange_with_grad(
-                        left_rank, right_rank, text_features_to_right)
+                        left_rank, right_rank, text_features_to_right
+                    )
 
                     loss += self._loss(
                         image_features,

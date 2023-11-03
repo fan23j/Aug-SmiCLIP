@@ -133,6 +133,19 @@ def parse_args(args):
         "--unpaired-epoch", type=int, default=30
     )
     parser.add_argument(
+        "--use-sinkhorn",
+        default=False,
+        action='store_true',
+    )
+    parser.add_argument(
+        "--use-sinkhorn-partial",
+        default=False,
+        action='store_true',
+    )
+    parser.add_argument(
+        "--feature-swap-ratio", type=float, default=0.1
+    )
+    parser.add_argument(
         "--workers", type=int, default=4, help="Number of dataloader workers per GPU."
     )
     parser.add_argument(
