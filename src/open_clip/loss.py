@@ -316,15 +316,15 @@ class ClipLoss(nn.Module):
 
         return loss
 
-    def iterate_P(sefl, sim_matrix, num_iterations=5):
-        P = torch.exp(sim_matrix)
+    def iterate_P(self, sim_matrix, num_iterations=5, tau=0.5):
+        P = torch.exp(sim_matrix/tau)
 
         for _ in range(num_iterations):
             rowP = P.sum(dim=0)
-            P /= rowP
+            P = torch.div(P, rowP.unsqueeze(0))
 
             colP = P.sum(dim=1)
-            P /= colP
+            P = torch.div(P, colP.unsqueeze(1))
         return P
 
     def forward(
@@ -370,7 +370,7 @@ class ClipLoss(nn.Module):
             all_image_aug_features,
             all_text_features,
             all_text_aug_features,
-            logit_scale,
+            1.0 if self.use_sinkhorn else logit_scale,
         )
 
         sim = torch.cat(
