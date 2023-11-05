@@ -23,10 +23,8 @@ try:
 except ImportError:
     tensorboard = None
 
-try:
-    import horovod.torch as hvd
-except ImportError:
-    hvd = None
+
+hvd = None
 
 from open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss
 from training.data import get_data
@@ -36,10 +34,9 @@ from training.params import parse_args
 from training.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from training.train import train_one_epoch, evaluate
 from training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
-import torch.distributed as dist
+# import torch.distributed as dist
 
-dist.init_process_group(backend='nccl', init_method='env://')
-
+# dist.init_process_group(backend="nccl", init_method="env://")
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
@@ -299,7 +296,7 @@ def main(args):
         if args.ddp_static_graph:
             # this doesn't exist in older PyTorch, arg only added if enabled
             ddp_args['static_graph'] = True
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device],  find_unused_parameters=False, **ddp_args)
     
         if args.distill:
             dist_model = torch.nn.parallel.DistributedDataParallel(dist_model, device_ids=[device], **ddp_args)

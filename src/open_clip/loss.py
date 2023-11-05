@@ -9,7 +9,8 @@ try:
     has_distributed = True
 except ImportError:
     has_distributed = False
-
+import matplotlib.pyplot as plt
+import numpy as np
 
 # def gather_features(
 #         image_features,
@@ -315,16 +316,29 @@ class ClipLoss(nn.Module):
         loss = torch.mean(per_sample_loss)
 
         return loss
-
-    def iterate_P(self, sim_matrix, num_iterations=5, tau=0.5):
-        P = torch.exp(sim_matrix/tau)
-
+    
+    def iterate_P(self, sim_matrix, num_iterations=3, tau=0.5):
+        max_val = torch.max(sim_matrix, dim=1, keepdim=True)[0]
+        sim_matrix = sim_matrix - max_val
+        P = torch.exp(sim_matrix / tau)
+        
         for _ in range(num_iterations):
             rowP = P.sum(dim=0)
-            P = torch.div(P, rowP.unsqueeze(0))
+            P = torch.div(P, rowP.unsqueeze(0) + 1e-9)
 
             colP = P.sum(dim=1)
-            P = torch.div(P, colP.unsqueeze(1))
+            P = torch.div(P, colP.unsqueeze(1) + 1e-9)
+#         sim_balanced = P.cpu()
+#         max_indices = sim_balanced.max(dim=1, keepdim=True)[1]
+#         binary_matrix = torch.zeros_like(sim_balanced)
+#         binary_matrix.scatter_(1, max_indices, 1)
+
+#         # Plot the binary matrix
+#         plt.imshow(binary_matrix.numpy(), cmap='hot', interpolation='nearest')
+#         plt.colorbar()
+
+#         # Save the figure
+#         plt.savefig('similarity_matrix.png', dpi=300)
         return P
 
     def forward(
@@ -370,7 +384,7 @@ class ClipLoss(nn.Module):
             all_image_aug_features,
             all_text_features,
             all_text_aug_features,
-            1.0 if self.use_sinkhorn else logit_scale,
+            logit_scale,
         )
 
         sim = torch.cat(
@@ -384,14 +398,15 @@ class ClipLoss(nn.Module):
         # Get the ground truth indices
         labels = torch.arange(sim.shape[0], device=device)
 
+
+        rows = -torch.mean(F.log_softmax(sim, dim=1)[labels, labels])
+        cols = -torch.mean(F.log_softmax(sim, dim=0)[labels, labels])
+        sinkhorn_loss = 0
         if self.use_sinkhorn:
             P = self.iterate_P(sim)
-            paired_loss = -torch.mean(torch.log(P)[labels, labels])
-        else:
-            rows = -torch.mean(F.log_softmax(sim, dim=1)[labels, labels])
-            cols = -torch.mean(F.log_softmax(sim, dim=0)[labels, labels])
+            sinkhorn_loss = -torch.mean(torch.log(P)[labels, labels]) * 0
 
-            paired_loss = rows + cols
+        paired_loss = rows + cols + sinkhorn_loss
 
         has_unpaired = unpaired_image_features is not None
         up_sim_image = None

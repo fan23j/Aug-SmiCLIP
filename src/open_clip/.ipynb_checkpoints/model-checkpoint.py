@@ -316,7 +316,7 @@ class CLIP(nn.Module):
             return out_dict
 
         if self.logit_bias is not None:
-            return image_features, image_aug_features, text_features, text_aug_features, self.logit_scale.exp(), self.logit_bias
+            return image_features, image_aug_features, text_features, text_aug_features, unpaired_image_features, unpaired_image_aug_features, self.logit_bias
         return image_features, image_aug_features, text_features, text_aug_features, unpaired_image_features, unpaired_image_aug_features, self.logit_scale.exp()
 
 
